@@ -1,0 +1,218 @@
+# Ubuntu Docker Samba & Time Machine Server
+
+This guide provides all the steps to turn a fresh Ubuntu Server installation into a powerful, containerized network backup server using Docker.
+
+This setup is optimized for a mixed-device environment (Mac, Windows, and iOS) and provides a secure, private alternative to cloud storage for backups and file sharing.
+
+## Features
+
+* **Samba File Share:** A general-purpose network drive (`Backups`) for Windows, Mac, and Linux.
+* **Time Machine Support:** A dedicated, fully compatible share (`TimeMachine`) for all your macOS devices.
+* **Correct Permissions:** Includes the fix for the common "read-only" bug on iPhone/iPad (iOS) and Mac.
+* **Containerized:** Uses Docker, so the entire service is isolated, easy to update, and easy to manage.
+* **Discoverable:** Uses Avahi (mDNS) so you can connect using a hostname like `my-server.local` instead of an IP.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Placeholders Used in This Guide
+
+Before you start, note these placeholders. You will need to replace them with your own values.
+
+* `your-admin-user`: Your main login username for the Ubuntu server.
+* `my-server`: Your server's hostname (e.g., `prodesk`, `storage`).
+* `/dev/sdb1`: The 8TB external drive's partition. **Check yours with `lsblk`!**
+* `YOUR_DRIVE_UUID`: The unique ID for your 8TB drive.
+* `Your/Timezone`: Your timezone (e.g., `America/New_York`, `Europe/London`).
+* `your-samba-user`: The single username for accessing the shares.
+* `your-samba-password`: The password for that share user.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Step 1: Install Ubuntu Server
+
+1.  **Download** the latest **Ubuntu Server LTS** (e.g., 24.04 LTS).
+2.  **Create a Bootable USB** using a tool like [Rufus](https://rufus.ie/) or [Etcher](https://www.balena.io/etcher/).
+3.  **Install Ubuntu** on your server (HP ProDesk):
+    * **Storage:** Install the OS on the **internal 120GB drive**, not your 8TB external one.
+    * **Identity:** Set your hostname (e.g., `my-server`) and create your admin user (e.g., `your-admin-user`).
+    * **SSH:** **Crucially**, check the box to **"Install OpenSSH server"**.
+    * **Software:** Do not select any other software.
+4.  Once installed, reboot and find the server's IP address (`ip a`).
+5.  From this point on, all commands are run from your main PC via SSH.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Step 2: Prepare the External Drive
+
+1.  Log in to your server:
+    ```bash
+    ssh your-admin-user@<server-ip-address>
+    ```
+
+2.  Plug in your 8TB drive. Find its device name (e.g., `/dev/sdb1`):
+    ```bash
+    lsblk
+    ```
+
+3.  Format the drive. **WARNING: This erases all data on the drive.**
+    ```bash
+    # Make 100% sure this is your 8TB drive partition!
+    sudo mkfs.ext4 /dev/sdb1
+    ```
+
+4.  Get the drive's unique ID (UUID) for auto-mounting:
+    ```bash
+    sudo blkid /dev/sdb1
+    ```
+    Copy the `UUID="..."` string. This is your `YOUR_DRIVE_UUID`.
+
+5.  Create a mount point and edit `fstab` to mount it on boot:
+    ```bash
+    sudo mkdir /mnt/backups
+    sudo nano /etc/fstab
+    ```
+    Add this one line to the very bottom of the file, using your UUID:
+    ```
+    UUID="YOUR_DRIVE_UUID" /mnt/backups ext4 defaults 0 0
+    ```
+    Save the file and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+6.  Mount the drive and create your share folders:
+    ```bash
+    # Reload systemd to see the fstab change
+    sudo systemctl daemon-reload
+    
+    # Mount all drives in fstab
+    sudo mount -a
+
+    # Create the folders
+    sudo mkdir /mnt/backups/general
+    sudo mkdir /mnt/backups/timemachine
+    ```
+
+7.  Set correct permissions for the drive:
+    ```bash
+    sudo chown -R your-admin-user:your-admin-user /mnt/backups
+    ```
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Step 3: Install Docker
+
+1.  Install Docker and Docker Compose:
+    ```bash
+    sudo apt update
+    sudo apt install docker.io docker-compose-v2 -y
+    ```
+
+2.  Add your user to the `docker` group to run commands without `sudo`:
+    ```bash
+    sudo usermod -aG docker your-admin-user
+    ```
+
+3.  **Log out and log back in** to apply the new group membership:
+    ```bash
+    exit
+    ```
+    Now, SSH back into your server.
+
+4.  Verify Docker is working (it should run without a permission error):
+    ```bash
+    docker ps
+    ```
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Step 4: Configure & Launch Samba Server
+
+1.  Get your user's `UID` and `GID`. They are almost always `1000`.
+    ```bash
+    id
+    ```
+    (Note the `uid=1000` and `gid=1000` numbers).
+
+2.  Create a project directory for your config file:
+    ```bash
+    mkdir ~/samba-server
+    cd ~/samba-server
+    ```
+
+3.  Create the `docker-compose.yml` file:
+    ```bash
+    nano docker-compose.yml
+    ```
+
+4.  Paste the entire block of code below into the file. Be sure to **change the 4 placeholders** for your Timezone, User, and Password.
+
+    ```yaml
+    services:
+      samba:
+        image: dperson/samba
+        container_name: samba
+        network_mode: "host"
+        environment:
+          # --- 1. Set your Timezone & User ID ---
+          - TZ=Your/Timezone
+          - USERID=1000
+          - GROUPID=1000
+          
+        volumes:
+          # --- 2. Link your 8TB drive folders ---
+          - /mnt/backups/general:/mnt/general
+          - /mnt/backups/timemachine:/mnt/timemachine
+    
+        command: >
+          # --- 3. Set Global Permissions (Fix for Apple) ---
+          -g "create mask = 0664"
+          -g "directory mask = 0775"
+          -g "force create mode = 0664"
+          -g "force directory mode = 0775"
+    
+          # --- 4. Define Your User ---
+          -u "your-samba-user;your-samba-password"
+    
+          # --- 5. Define Your Shares ---
+          -s "Backups;/mnt/general;yes;no;no;your-samba-user"
+          -s "TimeMachine;/mnt/timemachine;yes;no;no;your-samba-user;;vfs objects = catia fruit streams_xattr fruit:time machine = yes"
+          
+        restart: unless-stopped
+    ```
+    Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+5.  Launch your new server!
+    ```bash
+    docker compose up -d
+    ```
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Step 5: (Recommended) Make Server Discoverable
+This installs the mDNS service so you can use `my-server.local` to connect.
+
+```bash
+sudo apt update
+sudo apt install avahi-daemon -y
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Step 6: Connect Your Devices
+Your server is live. Use the credentials you defined in the docker-compose.yml file.
+
+Server Address: my-server.local
+
+Username: your-samba-user
+
+Password: your-samba-password
+
+🍏 On a Mac:
+General Share: In Finder > Go > Connect to Server... and type smb://my-server.local/Backups.
+
+Time Machine: Go to System Settings > General > Time Machine > Add Backup Disk... and select TimeMachine on "my-server.local".
+
+🪟 On Windows:
+General Share: In File Explorer, right-click "This PC" > "Map network drive..." and use the path \\my-server.local\Backups.
+
+📱 On iPhone/iPad:
+Open the Files app > Browse > ... icon > Connect to Server.
+
+Enter smb://my-server.local and log in with your Samba credentials.
